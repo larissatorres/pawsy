@@ -46,10 +46,17 @@ export default function App(){
   // load profile + vet status whenever the user changes
   async function hydrate(u){
     if(!u){setProfile(null);setVetStatus(undefined);setRole(null);return}
-    const[p,vs]=await Promise.all([getProfile(u.id),getMyVetStatus(u.id)])
-    setProfile(p)
-    setVetStatus(vs)
-    if(p?.role) setRole(p.role)
+    try{
+      const[p,vs]=await Promise.all([getProfile(u.id),getMyVetStatus(u.id)])
+      setProfile(p)
+      setVetStatus(vs)
+      // DB enum stores 'user'|'shelter'; UI uses 'public'|'vet'|'shelter'
+      if(p?.role) setRole(p.role==='user'?'public':p.role)
+    }catch(e){
+      console.warn('hydrate failed, continuing with defaults:',e)
+      setProfile({id:u.id,role:'user',is_admin:false})
+      setVetStatus(null)
+    }
   }
 
   useEffect(()=>{
