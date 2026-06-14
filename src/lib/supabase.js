@@ -11,12 +11,24 @@ export const getSession = () => supabase.auth.getSession()
 export const onAuthChange = (cb) => supabase.auth.onAuthStateChange((_e, s) => cb(s?.user || null))
 
 // ─── Profile (role + admin) ───
+// DB enum user_role accepts: 'user' | 'shelter' | 'admin'.
+// The UI uses 'public'/'vet'/'shelter'; map before writing.
+function uiRoleToDb(role){
+  if(role==='shelter') return 'shelter'
+  return 'user' // 'public' and 'vet' both persist as 'user' (vet status lives in vet_verifications)
+}
 export async function getProfile(userId) {
-  const { data } = await supabase.from('profiles').select('*').eq('id', userId).single()
-  return data || null
+  // maybeSingle() returns null (not a 406 error) when the row doesn't exist yet
+  const { data } = await supabase.from('profiles').select('*').eq('id', userId).maybeSingle()
+  if (data) return data
+  // Self-heal: create the profile if the signup trigger never ran for this user
+  const { data: created } = await supabase.from('profiles')
+    .upsert({ id: userId, role: 'user' }, { onConflict: 'id' })
+    .select().maybeSingle()
+  return created || { id: userId, role: 'user', is_admin: false }
 }
 export async function setProfileRole(userId, role) {
-  const { error } = await supabase.from('profiles').update({ role }).eq('id', userId)
+  const { error } = await supabase.from('profiles').update({ role: uiRoleToDb(role) }).eq('id', userId)
   return !error
 }
 
