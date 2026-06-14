@@ -1,14 +1,17 @@
 import { useState, useEffect, useRef } from 'react'
 import { Html5Qrcode } from 'html5-qrcode'
 import { supabase, signInWithGoogle, signOut, onAuthChange, searchMicrochip,
-  registerMicrochip, getMyPets, updatePet, deletePet, uploadPhoto } from './lib/supabase'
+  registerMicrochip, getMyPets, updatePet, deletePet, uploadPhoto,
+  getProfile, setProfileRole, getMyVetStatus, submitVetVerification, uploadVetDoc,
+  listPendingVets, reviewVet, getVetDocSignedUrl, isValidEmail, isValidPhone } from './lib/supabase'
+import { validateChip, chipReason } from './lib/microchip'
 
 const C = {
   bg:'#FAFAF7',card:'#FFF',primary:'#FF6B4A',primaryDark:'#E0523A',primaryLight:'#FFF0EC',
   secondary:'#1B4332',secondaryLight:'#D8F3DC',accent:'#FFB347',text:'#1A1A1A',
   textMid:'#4A5568',textLight:'#94A3B8',border:'#F0EDE8',success:'#10B981',successBg:'#ECFDF5',
   info:'#3B82F6',infoBg:'#EFF6FF',urgent:'#EF4444',vet:'#7C3AED',vetBg:'#F5F3FF',
-  shelter:'#0891B2',shelterBg:'#ECFEFF',
+  shelter:'#0891B2',shelterBg:'#ECFEFF',warn:'#D97706',warnBg:'#FFFBEB',
 }
 
 const Btn=({children,primary,full,small,disabled,onClick,style:s})=>(
@@ -16,6 +19,8 @@ const Btn=({children,primary,full,small,disabled,onClick,style:s})=>(
 )
 
 const Steps=({c,t})=><div style={{display:'flex',gap:6,marginBottom:24}}>{Array.from({length:t},(_,i)=><div key={i} style={{flex:1,height:4,borderRadius:2,background:i<=c?C.primary:C.border,transition:'all 0.4s'}}/>)}</div>
+
+const Input=({err,...p})=><input {...p} style={{width:'100%',padding:'12px 14px',borderRadius:12,border:`1.5px solid ${err?C.urgent:C.border}`,fontSize:14,fontFamily:"'Nunito',sans-serif",outline:'none',background:C.bg,boxSizing:'border-box',...(p.style||{})}}/>
 
 function Scanner({onScan,onClose}){
   const ref=useRef(null)
@@ -30,38 +35,79 @@ function Scanner({onScan,onClose}){
 // ═══ MAIN APP ═══
 export default function App(){
   const[user,setUser]=useState(null)
+  const[profile,setProfile]=useState(null)   // { role, is_admin }
+  const[vetStatus,setVetStatus]=useState(undefined) // undefined=loading, null=never applied, obj=record
   const[loading,setLoading]=useState(true)
   const[screen,setScreen]=useState('home')
   const[role,setRole]=useState(null)
-  const[vetOk,setVetOk]=useState(false)
   const[toast,setToast]=useState(null)
   const[editPet,setEditPet]=useState(null)
 
+  // load profile + vet status whenever the user changes
+  async function hydrate(u){
+    if(!u){setProfile(null);setVetStatus(undefined);setRole(null);return}
+    const[p,vs]=await Promise.all([getProfile(u.id),getMyVetStatus(u.id)])
+    setProfile(p)
+    setVetStatus(vs)
+    if(p?.role) setRole(p.role)
+  }
+
   useEffect(()=>{
-    supabase.auth.getSession().then(({data:{session}})=>{setUser(session?.user||null);setLoading(false)})
-    const{data:{subscription}}=onAuthChange(u=>setUser(u))
-    return()=>subscription.unsubscribe()
+    let mounted=true
+    supabase.auth.getSession().then(async({data:{session}})=>{
+      const u=session?.user||null
+      if(!mounted)return
+      setUser(u)
+      await hydrate(u)
+      if(mounted)setLoading(false)
+    })
+    const{data:{subscription}}=onAuthChange(async u=>{
+      setUser(u)
+      await hydrate(u)
+      setLoading(false)
+    })
+    return()=>{mounted=false;subscription.unsubscribe()}
   },[])
 
   const show=m=>{setToast(m);setTimeout(()=>setToast(null),2500)}
   const go=s=>{setScreen(s);window.scrollTo?.(0,0)}
 
+  const isVetVerified = vetStatus?.status==='verified'
+  const isAdmin = !!profile?.is_admin
+
+  // choosing a role from Home
+  async function chooseRole(r){
+    setRole(r)
+    if(user) setProfileRole(user.id,r) // persist, fire-and-forget
+    if(r==='vet'){
+      // vets must be verified to reach the dashboard with private access
+      if(isVetVerified) go('dash')
+      else go('vetVerify')
+    } else {
+      go('dash')
+    }
+  }
+
   if(loading)return<Wrap><div style={{display:'flex',alignItems:'center',justifyContent:'center',height:'100vh',flexDirection:'column',gap:12}}><div style={{fontSize:48}}>🐾</div><div style={{fontSize:14,color:C.textLight}}>Loading Pawsy...</div></div></Wrap>
+
+  // effective role for the UI: a vet who isn't verified behaves as 'public'
+  const effectiveRole = (role==='vet' && !isVetVerified) ? 'public' : role
 
   return(
     <Wrap>
-      <Header user={user} role={role} screen={screen} go={go}/>
+      <Header user={user} role={role} vetVerified={isVetVerified} admin={isAdmin} screen={screen} go={go}/>
       <div style={{flex:1,overflowY:'auto',paddingBottom:20}}>
         {!user && screen!=='search' ? <LoginScreen/> :
-         screen==='home' ? <Home setRole={r=>{setRole(r);go(r==='vet'&&!vetOk?'vetVerify':'dash')}} user={user} go={go}/> :
-         screen==='vetVerify' ? <VetVerify done={()=>{setVetOk(true);go('dash')}}/> :
-         screen==='dash' ? <Dash role={role} go={go} setRole={setRole}/> :
-         screen==='register' ? <Register role={role} user={user} show={show} back={()=>go('dash')}/> :
-         screen==='search' ? <Search role={role} user={user} show={show}/> :
+         screen==='home' ? <Home chooseRole={chooseRole} user={user} go={go} admin={isAdmin}/> :
+         screen==='vetVerify' ? <VetVerify user={user} status={vetStatus} onSubmitted={vs=>{setVetStatus(vs);go('dash')}} onBack={()=>go('home')}/> :
+         screen==='admin' ? (isAdmin ? <AdminPanel user={user} show={show}/> : <Home chooseRole={chooseRole} user={user} go={go} admin={isAdmin}/>) :
+         screen==='dash' ? <Dash role={role} effectiveRole={effectiveRole} vetStatus={vetStatus} go={go} setRole={setRole}/> :
+         screen==='register' ? <Register role={effectiveRole} user={user} show={show} back={()=>go('dash')}/> :
+         screen==='search' ? <Search role={effectiveRole} user={user} show={show}/> :
          screen==='profile' ? <Profile user={user} go={go} show={show} setEdit={p=>{setEditPet(p);go('edit')}}/> :
          screen==='edit' ? <EditPetScreen pet={editPet} show={show} back={()=>go('profile')}/> :
          screen==='settings' ? <Settings user={user} go={go}/> :
-         <Home setRole={r=>{setRole(r);go('dash')}} user={user} go={go}/>
+         <Home chooseRole={chooseRole} user={user} go={go} admin={isAdmin}/>
         }
       </div>
       {toast&&<div style={{position:'fixed',top:'40%',left:'50%',transform:'translate(-50%,-50%)',background:'rgba(27,67,50,0.95)',color:'#fff',padding:'20px 32px',borderRadius:22,textAlign:'center',zIndex:100,boxShadow:'0 15px 50px rgba(0,0,0,0.25)',maxWidth:300}}><div style={{fontSize:15,fontWeight:800}}>{toast}</div></div>}
@@ -76,13 +122,14 @@ function Wrap({children}){return(
   </div>
 )}
 
-function Header({user,role,screen,go}){
-  const R={vet:{l:'Vet',c:C.vet,b:C.vetBg},shelter:{l:'Shelter',c:C.shelter,b:C.shelterBg},public:{l:'Public',c:C.info,b:C.infoBg}}
+function Header({user,role,vetVerified,admin,screen,go}){
+  const R={vet:{l:vetVerified?'Vet ✓':'Vet (pending)',c:C.vet,b:C.vetBg},shelter:{l:'Shelter',c:C.shelter,b:C.shelterBg},public:{l:'Public',c:C.info,b:C.infoBg}}
   return(
   <div style={{padding:'14px 20px 10px',display:'flex',alignItems:'center',gap:10,background:C.bg,position:'sticky',top:0,zIndex:50,borderBottom:`1px solid ${C.border}`}}>
-    {!['home',''].includes(screen)&&<button onClick={()=>go(screen==='dash'?'home':screen==='edit'?'profile':'dash')} style={{background:C.card,border:`1px solid ${C.border}`,fontSize:16,padding:'7px 11px',borderRadius:12,cursor:'pointer'}}>←</button>}
+    {!['home',''].includes(screen)&&<button onClick={()=>go(screen==='dash'?'home':screen==='edit'?'profile':screen==='admin'?'home':'dash')} style={{background:C.card,border:`1px solid ${C.border}`,fontSize:16,padding:'7px 11px',borderRadius:12,cursor:'pointer'}}>←</button>}
     <div style={{width:34,height:34,borderRadius:11,background:`linear-gradient(135deg,${C.primary},${C.accent})`,display:'flex',alignItems:'center',justifyContent:'center',fontSize:16,boxShadow:'0 3px 10px rgba(255,107,74,0.25)'}}>🐾</div>
     <div style={{flex:1}}><div style={{fontSize:17,fontWeight:900,fontFamily:"'Playfair Display',serif"}}>Pawsy</div><div style={{fontSize:9,color:C.textLight,fontWeight:600}}>Global Pet Microchip Registry</div></div>
+    {admin&&<button onClick={()=>go('admin')} style={{padding:'4px 10px',borderRadius:10,fontSize:10,fontWeight:800,background:C.secondaryLight,color:C.secondary,border:'none',cursor:'pointer'}}>🛡️ Admin</button>}
     {role&&R[role]&&<div style={{padding:'4px 10px',borderRadius:10,fontSize:10,fontWeight:800,background:R[role].b,color:R[role].c}}>{R[role].l}</div>}
     {user&&<button onClick={()=>go('profile')} style={{width:34,height:34,borderRadius:'50%',border:'none',cursor:'pointer',overflow:'hidden',background:C.border,padding:0}}>
       {user.user_metadata?.avatar_url?<img src={user.user_metadata.avatar_url} style={{width:34,height:34,borderRadius:'50%'}} referrerPolicy="no-referrer"/>:<span style={{fontSize:16}}>👤</span>}
@@ -106,7 +153,7 @@ function LoginScreen(){
 }
 
 // ═══ HOME ═══
-function Home({setRole,user,go}){
+function Home({chooseRole,user,go,admin}){
   return(
   <div style={{padding:'0 20px'}}>
     <div style={{background:`linear-gradient(135deg,${C.primary} 0%,#FF8A65 50%,${C.accent} 100%)`,borderRadius:26,padding:'34px 24px',marginBottom:24,position:'relative',overflow:'hidden',textAlign:'center'}}>
@@ -120,7 +167,7 @@ function Home({setRole,user,go}){
     {[{r:'vet',icon:'🩺',t:'Register chips (Vet)',c:C.vet,b:C.vetBg,bo:'#C4B5FD'},
       {r:'shelter',icon:'🏠',t:'Register rescued pets',c:C.shelter,b:C.shelterBg,bo:'#A5F3FC'},
       {r:'public',icon:'👤',t:'Search or register my pet',c:C.info,b:C.infoBg,bo:'#BFDBFE'},
-    ].map(r=><button key={r.r} onClick={()=>setRole(r.r)} style={{display:'flex',alignItems:'center',gap:14,padding:'18px 16px',width:'100%',background:C.card,borderRadius:20,border:`2px solid ${r.bo}`,cursor:'pointer',textAlign:'left',fontFamily:"'Nunito',sans-serif",marginBottom:10,boxShadow:'0 3px 14px rgba(0,0,0,0.04)'}}>
+    ].map(r=><button key={r.r} onClick={()=>chooseRole(r.r)} style={{display:'flex',alignItems:'center',gap:14,padding:'18px 16px',width:'100%',background:C.card,borderRadius:20,border:`2px solid ${r.bo}`,cursor:'pointer',textAlign:'left',fontFamily:"'Nunito',sans-serif",marginBottom:10,boxShadow:'0 3px 14px rgba(0,0,0,0.04)'}}>
       <div style={{width:50,height:50,borderRadius:16,background:r.b,display:'flex',alignItems:'center',justifyContent:'center',fontSize:24,flexShrink:0}}>{r.icon}</div>
       <div style={{flex:1,fontSize:15,fontWeight:800,color:r.c}}>{r.t}</div>
       <span style={{color:C.textLight,fontSize:18}}>›</span>
@@ -140,34 +187,157 @@ function Home({setRole,user,go}){
   </div>)
 }
 
-// ═══ VET VERIFY ═══
-function VetVerify({done}){
-  const[f,sF]=useState({clinic:'',license:'',city:''})
+// ═══ VET VERIFY (real flow) ═══
+function VetVerify({user,status,onSubmitted,onBack}){
+  const[f,sF]=useState({clinic:status?.clinic_name||'',license:status?.license_no||'',city:status?.city||''})
   const[ok,sO]=useState(false)
+  const[docFile,setDocFile]=useState(null)
+  const[docName,setDocName]=useState('')
+  const[saving,setSaving]=useState(false)
+  const[err,setErr]=useState('')
+  const docRef=useRef()
+
+  // Already submitted → show status instead of the form
+  if(status && status.status==='pending')return(
+    <div style={{padding:'40px 20px',textAlign:'center'}}>
+      <div style={{width:90,height:90,borderRadius:'50%',background:C.warnBg,display:'flex',alignItems:'center',justifyContent:'center',fontSize:44,margin:'0 auto 20px',border:`3px solid ${C.warn}`}}>⏳</div>
+      <h2 style={{fontSize:22,fontWeight:900,fontFamily:"'Playfair Display',serif",marginBottom:10}}>Verification pending</h2>
+      <p style={{fontSize:13,color:C.textMid,lineHeight:1.6,maxWidth:300,margin:'0 auto 8px'}}>Your professional details are under review. Until approved, you can use Pawsy with public access (search + register your own pets).</p>
+      <div style={{background:C.card,borderRadius:14,padding:14,border:`1px solid ${C.border}`,textAlign:'left',maxWidth:300,margin:'16px auto'}}>
+        <div style={{fontSize:13,fontWeight:800}}>🏥 {status.clinic_name}</div>
+        <div style={{fontSize:12,color:C.textMid}}>Lic. {status.license_no} · {status.city}</div>
+      </div>
+      <Btn onClick={onBack}>← Back to home</Btn>
+    </div>)
+
+  if(status && status.status==='rejected')return(
+    <div style={{padding:'30px 20px'}}>
+      <div style={{background:'#FEF2F2',borderRadius:16,padding:16,border:`1px solid #FECACA`,marginBottom:16}}>
+        <div style={{fontSize:14,fontWeight:900,color:C.urgent,marginBottom:6}}>❌ Verification rejected</div>
+        {status.reject_reason&&<div style={{fontSize:12,color:C.textMid}}>Reason: {status.reject_reason}</div>}
+        <div style={{fontSize:12,color:C.textMid,marginTop:6}}>You can correct your details and resubmit below.</div>
+      </div>
+      {/* falls through to form */}
+      <VetForm {...{f,sF,ok,sO,docFile,setDocFile,docName,setDocName,saving,err,docRef,user,onSubmitted,setSaving,setErr,resubmit:true}}/>
+    </div>)
+
   return(
   <div style={{padding:'0 20px'}}>
-    <div style={{textAlign:'center',marginBottom:20}}><div style={{fontSize:44,marginBottom:8}}>🩺</div><h2 style={{fontSize:20,fontWeight:900,fontFamily:"'Playfair Display',serif"}}>Vet Verification</h2><p style={{fontSize:12,color:C.textLight}}>Quick verification for professional access</p></div>
+    <div style={{textAlign:'center',marginBottom:20}}><div style={{fontSize:44,marginBottom:8}}>🩺</div><h2 style={{fontSize:20,fontWeight:900,fontFamily:"'Playfair Display',serif"}}>Vet Verification</h2><p style={{fontSize:12,color:C.textLight,maxWidth:300,margin:'4px auto'}}>To access owner contact data, professionals are verified manually. This protects pet owners under GDPR.</p></div>
+    <VetForm {...{f,sF,ok,sO,docFile,setDocFile,docName,setDocName,saving,err,docRef,user,onSubmitted,setSaving,setErr}}/>
+  </div>)
+}
+
+function VetForm({f,sF,ok,sO,docFile,setDocFile,docName,setDocName,saving,err,docRef,user,onSubmitted,setSaving,setErr,resubmit}){
+  const pickDoc=e=>{const file=e.target.files?.[0];if(file){setDocFile(file);setDocName(file.name)}}
+  const submit=async()=>{
+    setErr('')
+    if(!f.clinic.trim()||!f.license.trim()){setErr('Clinic and license number are required');return}
+    if(!docFile){setErr('Please attach proof of your professional license');return}
+    if(!ok){setErr('Please confirm the declaration');return}
+    setSaving(true)
+    let docPath=null
+    try{const up=await uploadVetDoc(docFile,user.id);docPath=up?.path||null}catch{}
+    if(!docPath){setSaving(false);setErr('Document upload failed — try a smaller image/PDF');return}
+    const{data,error}=await submitVetVerification(user.id,{clinic_name:f.clinic.trim(),license_no:f.license.trim(),city:f.city.trim(),country:'ES',document_url:docPath})
+    setSaving(false)
+    if(error){setErr('Could not submit — please retry');return}
+    onSubmitted(data)
+  }
+  return(
+  <>
     <div style={{background:C.card,borderRadius:18,padding:18,border:`1px solid ${C.border}`,marginBottom:16}}>
-      {[{k:'clinic',l:'Clinic name',p:'e.g., Clínica Veterinaria Madrid'},{k:'license',l:'License number',p:'Colegiado nº'},{k:'city',l:'City',p:'e.g., Madrid'}].map(x=><div key={x.k} style={{marginBottom:12}}><label style={{fontSize:12,fontWeight:800,display:'block',marginBottom:5}}>{x.l}</label><input value={f[x.k]} onChange={e=>sF({...f,[x.k]:e.target.value})} placeholder={x.p} style={{width:'100%',padding:'12px 14px',borderRadius:12,border:`1.5px solid ${C.border}`,fontSize:14,fontFamily:"'Nunito',sans-serif",outline:'none',background:C.bg,boxSizing:'border-box'}}/></div>)}
+      {[{k:'clinic',l:'Clinic name',p:'e.g., Clínica Veterinaria Madrid'},{k:'license',l:'License number (colegiado)',p:'e.g., COLVET 28/1234'},{k:'city',l:'City',p:'e.g., Madrid'}].map(x=><div key={x.k} style={{marginBottom:12}}><label style={{fontSize:12,fontWeight:800,display:'block',marginBottom:5}}>{x.l}</label><Input value={f[x.k]} onChange={e=>sF({...f,[x.k]:e.target.value})} placeholder={x.p}/></div>)}
+
+      <label style={{fontSize:12,fontWeight:800,display:'block',marginBottom:5}}>Proof of license (photo or PDF)</label>
+      <div onClick={()=>docRef.current?.click()} style={{border:`2px dashed ${docFile?C.success:C.border}`,borderRadius:12,padding:'16px',textAlign:'center',cursor:'pointer',background:C.bg,marginBottom:12}}>
+        <div style={{fontSize:24,marginBottom:4}}>{docFile?'📎':'⬆️'}</div>
+        <div style={{fontSize:12,fontWeight:700,color:docFile?C.success:C.textMid}}>{docFile?docName:'Tap to attach carteira / certificado'}</div>
+      </div>
+      <input ref={docRef} type="file" accept="image/*,application/pdf" onChange={pickDoc} style={{display:'none'}}/>
+
       <div onClick={()=>sO(!ok)} style={{display:'flex',gap:10,cursor:'pointer',padding:'10px 0'}}>
         <div style={{width:22,height:22,borderRadius:6,border:`2px solid ${ok?C.success:C.border}`,background:ok?C.success:'transparent',display:'flex',alignItems:'center',justifyContent:'center',color:'#fff',fontSize:13,fontWeight:900,flexShrink:0}}>{ok?'✓':''}</div>
-        <div style={{fontSize:11,color:C.textMid,lineHeight:1.5}}>I confirm I am a licensed veterinary professional and agree to handle data responsibly under GDPR.</div>
+        <div style={{fontSize:11,color:C.textMid,lineHeight:1.5}}>I declare I am a licensed veterinary professional. I understand providing false information may be a legal offence, and I agree to handle owner data under GDPR.</div>
       </div>
     </div>
-    <Btn primary full disabled={!f.clinic||!f.license||!ok} onClick={done}>✅ Verify & Continue</Btn>
+    {err&&<div style={{background:'#FEF2F2',color:C.urgent,fontSize:12,fontWeight:700,padding:'10px 14px',borderRadius:10,marginBottom:12}}>{err}</div>}
+    <Btn primary full disabled={saving} onClick={submit}>{saving?'Submitting...':resubmit?'🔁 Resubmit for review':'📤 Submit for verification'}</Btn>
+  </>)
+}
+
+// ═══ ADMIN PANEL ═══
+function AdminPanel({user,show}){
+  const[list,setList]=useState(null)
+  const[busy,setBusy]=useState(null)
+
+  const load=async()=>setList(await listPendingVets())
+  useEffect(()=>{load()},[])
+
+  const viewDoc=async(path)=>{const u=await getVetDocSignedUrl(path);if(u)window.open(u,'_blank');else show('No document')}
+  const act=async(id,status)=>{
+    let reason=null
+    if(status==='rejected'){reason=prompt('Reason for rejection (shown to vet):')||'Not specified'}
+    setBusy(id)
+    const okk=await reviewVet(id,status,user.id,reason)
+    setBusy(null)
+    if(okk){show(status==='verified'?'✅ Vet approved':'❌ Vet rejected');load()}
+    else show('Action failed')
+  }
+
+  const pending=(list||[]).filter(v=>v.status==='pending')
+  const reviewed=(list||[]).filter(v=>v.status!=='pending')
+
+  return(
+  <div style={{padding:'0 20px'}}>
+    <h2 style={{fontSize:20,fontWeight:900,fontFamily:"'Playfair Display',serif",marginBottom:4}}>🛡️ Admin — Vet Reviews</h2>
+    <p style={{fontSize:12,color:C.textLight,marginBottom:20}}>Approve or reject professional access requests</p>
+
+    {list===null?<div style={{textAlign:'center',padding:30,color:C.textLight}}>Loading...</div>:
+    <>
+      <div style={{fontSize:13,fontWeight:900,marginBottom:10}}>Pending ({pending.length})</div>
+      {pending.length===0?<div style={{textAlign:'center',padding:24,background:C.card,borderRadius:16,border:`1px solid ${C.border}`,color:C.textLight,fontSize:13,marginBottom:20}}>No pending requests 🎉</div>:
+      pending.map(v=>(
+        <div key={v.id} style={{background:C.card,borderRadius:16,padding:16,border:`1px solid ${C.border}`,marginBottom:10}}>
+          <div style={{fontSize:15,fontWeight:900}}>🏥 {v.clinic_name}</div>
+          <div style={{fontSize:12,color:C.textMid,marginBottom:8}}>Lic. {v.license_no} · {v.city||'—'} · {v.country}</div>
+          {v.document_url&&<button onClick={()=>viewDoc(v.document_url)} style={{background:C.infoBg,border:'none',borderRadius:10,padding:'7px 12px',fontSize:12,fontWeight:800,color:C.info,cursor:'pointer',marginBottom:10,fontFamily:"'Nunito',sans-serif"}}>📎 View document</button>}
+          <div style={{display:'flex',gap:8}}>
+            <Btn primary small full disabled={busy===v.id} onClick={()=>act(v.id,'verified')}>{busy===v.id?'...':'✅ Approve'}</Btn>
+            <Btn small full disabled={busy===v.id} onClick={()=>act(v.id,'rejected')} style={{borderColor:C.urgent,color:C.urgent}}>❌ Reject</Btn>
+          </div>
+        </div>
+      ))}
+
+      {reviewed.length>0&&<>
+        <div style={{fontSize:13,fontWeight:900,margin:'20px 0 10px'}}>Reviewed ({reviewed.length})</div>
+        {reviewed.map(v=>(
+          <div key={v.id} style={{background:C.card,borderRadius:14,padding:'12px 14px',border:`1px solid ${C.border}`,marginBottom:8,display:'flex',alignItems:'center',gap:10}}>
+            <div style={{flex:1}}><div style={{fontSize:13,fontWeight:800}}>{v.clinic_name}</div><div style={{fontSize:11,color:C.textLight}}>Lic. {v.license_no}</div></div>
+            <span style={{fontSize:10,fontWeight:800,padding:'4px 10px',borderRadius:10,background:v.status==='verified'?C.successBg:'#FEF2F2',color:v.status==='verified'?C.success:C.urgent}}>{v.status}</span>
+          </div>
+        ))}
+      </>}
+    </>}
   </div>)
 }
 
 // ═══ DASHBOARD ═══
-function Dash({role,go,setRole}){
+function Dash({role,effectiveRole,vetStatus,go,setRole}){
+  const pendingVet = role==='vet' && vetStatus?.status==='pending'
+  const rejectedVet = role==='vet' && vetStatus?.status==='rejected'
   return(
   <div style={{padding:'0 20px'}}>
     <h2 style={{fontSize:20,fontWeight:900,fontFamily:"'Playfair Display',serif",marginBottom:4}}>{role==='vet'?'🩺 Vet':role==='shelter'?'🏠 Shelter':'👤 My'} Dashboard</h2>
-    <p style={{fontSize:12,color:C.textLight,marginBottom:20}}>Register and search microchips</p>
+    <p style={{fontSize:12,color:C.textLight,marginBottom:16}}>Register and search microchips</p>
+
+    {pendingVet&&<div style={{background:C.warnBg,borderRadius:14,padding:'12px 14px',border:`1px solid #FDE68A`,marginBottom:16,fontSize:12,color:'#92400E',lineHeight:1.5}}>⏳ Your vet verification is pending. You currently have <b>public access</b>. Owner contact data unlocks once approved.</div>}
+    {rejectedVet&&<div style={{background:'#FEF2F2',borderRadius:14,padding:'12px 14px',border:`1px solid #FECACA`,marginBottom:16,fontSize:12,color:C.urgent,lineHeight:1.5}}>❌ Verification rejected. <span onClick={()=>go('vetVerify')} style={{textDecoration:'underline',cursor:'pointer',fontWeight:800}}>Resubmit</span> to gain professional access.</div>}
+
     {['register','search','profile'].map(s=>(
       <button key={s} onClick={()=>go(s)} style={{display:'flex',alignItems:'center',gap:14,padding:'20px 18px',width:'100%',background:C.card,borderRadius:20,border:`1px solid ${C.border}`,cursor:'pointer',textAlign:'left',fontFamily:"'Nunito',sans-serif",marginBottom:10,boxShadow:'0 2px 12px rgba(0,0,0,0.03)'}}>
         <div style={{width:50,height:50,borderRadius:16,background:s==='register'?C.secondaryLight:s==='search'?C.infoBg:C.primaryLight,display:'flex',alignItems:'center',justifyContent:'center',fontSize:24,flexShrink:0}}>{s==='register'?'📷':s==='search'?'🔍':'👤'}</div>
-        <div style={{flex:1}}><div style={{fontSize:15,fontWeight:800}}>{s==='register'?'Register Microchip':s==='search'?'Search Microchip':'My Profile & Pets'}</div><div style={{fontSize:11,color:C.textLight}}>{s==='register'?'Scan → Register → Done':s==='search'?'Find pet/owner info':'View & edit your registrations'}</div></div>
+        <div style={{flex:1}}><div style={{fontSize:15,fontWeight:800}}>{s==='register'?'Register Microchip':s==='search'?'Search Microchip':'My Profile & Pets'}</div><div style={{fontSize:11,color:C.textLight}}>{s==='register'?'Scan → Register → Done':s==='search'?(effectiveRole==='vet'||effectiveRole==='shelter'?'Find pet/owner info':'Find pet info'):'View & edit your registrations'}</div></div>
         <span style={{color:C.textLight,fontSize:18}}>›</span>
       </button>
     ))}
@@ -179,32 +349,53 @@ function Dash({role,go,setRole}){
 function Register({role,user,show,back}){
   const[step,setStep]=useState(0)
   const[chip,setChip]=useState('')
+  const[chipInfo,setChipInfo]=useState(null) // validateChip result
   const[scanned,setScanned]=useState(false)
   const[scanning,setScanning]=useState(false)
   const[manual,setManual]=useState(false)
+  const[chipErr,setChipErr]=useState('')
   const[photoFile,setPhotoFile]=useState(null)
   const[photoPreview,setPhotoPreview]=useState(null)
   const[gdpr,setGdpr]=useState(false)
   const[done,setDone]=useState(false)
   const[saving,setSaving]=useState(false)
+  const[dupe,setDupe]=useState(false)
   const[form,setForm]=useState({animal_name:'',species:'cat',color:'',sex:'unknown',owner_name:'',owner_phone:'',owner_email:'',owner_city:''})
+  const[touched,setTouched]=useState({})
   const fileRef=useRef()
   const u=(k,v)=>setForm(p=>({...p,[k]:v}))
 
-  const onScan=t=>{setChip(t);setScanned(true);setScanning(false);setTimeout(()=>setStep(1),600)}
+  // accept a chip from scan or manual, validating ISO format
+  const acceptChip=(value)=>{
+    const info=validateChip(value)
+    if(!info.valid){setChipErr(chipReason(info.reason,info.length));setChipInfo(null);return false}
+    setChip(info.chip);setChipInfo(info);setChipErr('');setScanned(true)
+    setTimeout(()=>setStep(1),500)
+    return true
+  }
+  const onScan=t=>{setScanning(false);acceptChip(t)}
 
   const handlePhoto=e=>{
     const f=e.target.files?.[0]
     if(f){setPhotoFile(f);const r=new FileReader();r.onload=x=>setPhotoPreview(x.target.result);r.readAsDataURL(f)}
   }
 
+  const emailErr = touched.owner_email && !isValidEmail(form.owner_email)
+  const phoneErr = touched.owner_phone && !isValidPhone(form.owner_phone)
+
   const register=async()=>{
-    setSaving(true)
+    setSaving(true);setDupe(false)
     let photoUrl=null
     if(photoFile&&user){try{photoUrl=await uploadPhoto(photoFile,user.id)}catch{}}
-    const data={chip_number:chip,species:form.species,animal_name:form.animal_name,color:form.color,sex:form.sex,owner_name:form.owner_name,owner_phone:form.owner_phone,owner_email:form.owner_email,owner_city:form.owner_city,owner_country:'ES',photo_url:photoUrl,registered_by_auth:user?.id}
-    await registerMicrochip(data)
-    setDone(true);setSaving(false);show('✅ Registered in Pawsy!')
+    const data={chip_number:chip,species:form.species,animal_name:form.animal_name,color:form.color,sex:form.sex,
+      owner_name:form.owner_name,owner_phone:form.owner_phone,owner_email:form.owner_email,owner_city:form.owner_city,
+      owner_country:'ES',photo_url:photoUrl,registered_by_auth:user?.id,
+      chip_country:chipInfo?.country||null,chip_manufacturer:chipInfo?.manufacturer||null}
+    const res=await registerMicrochip(data)
+    setSaving(false)
+    if(res.duplicate){setDupe(true);return}
+    if(!res.success){show('⚠️ Could not save — please retry');return}
+    setDone(true);show('✅ Registered in Pawsy!')
   }
 
   if(done)return(
@@ -214,10 +405,11 @@ function Register({role,user,show,back}){
       <div style={{background:C.card,borderRadius:16,padding:16,border:`1px solid ${C.border}`,textAlign:'left',marginBottom:20}}>
         {photoPreview&&<img src={photoPreview} style={{width:'100%',height:120,objectFit:'cover',borderRadius:12,marginBottom:12}}/>}
         <div style={{fontSize:13,fontFamily:"'JetBrains Mono',monospace",color:C.primary,background:C.primaryLight,padding:'8px 12px',borderRadius:10,marginBottom:10,fontWeight:700}}>📟 {chip}</div>
+        {chipInfo&&<div style={{fontSize:11,color:C.textMid,marginBottom:10}}>{chipInfo.type==='country'?`📍 ${chipInfo.country}`:chipInfo.type==='manufacturer'?`🏭 ${chipInfo.manufacturer}`:'🔖 Legacy chip'} · {chipInfo.standard}</div>}
         <div style={{fontSize:15,fontWeight:900}}>{form.animal_name}</div>
         <div style={{fontSize:12,color:C.textMid}}>👤 {form.owner_name} · 📍 {form.owner_city}</div>
       </div>
-      <Btn primary full onClick={()=>{setDone(false);setStep(0);setChip('');setScanned(false);setPhotoFile(null);setPhotoPreview(null);setGdpr(false);setManual(false);setForm({animal_name:'',species:'cat',color:'',sex:'unknown',owner_name:'',owner_phone:'',owner_email:'',owner_city:''})}}>📷 Register another</Btn>
+      <Btn primary full onClick={()=>{setDone(false);setStep(0);setChip('');setChipInfo(null);setScanned(false);setPhotoFile(null);setPhotoPreview(null);setGdpr(false);setManual(false);setTouched({});setForm({animal_name:'',species:'cat',color:'',sex:'unknown',owner_name:'',owner_phone:'',owner_email:'',owner_city:''})}}>📷 Register another</Btn>
       <button onClick={back} style={{background:'none',border:'none',color:C.primary,fontWeight:700,fontSize:13,marginTop:14,cursor:'pointer',fontFamily:"'Nunito',sans-serif"}}>← Dashboard</button>
     </div>)
 
@@ -231,11 +423,16 @@ function Register({role,user,show,back}){
       scanned?<div style={{background:C.successBg,borderRadius:18,padding:22,border:`2px solid ${C.success}`,textAlign:'center'}}><div style={{fontSize:44,marginBottom:8}}>✅</div><div style={{fontSize:13,fontWeight:800,color:C.success}}>Scanned!</div><div style={{fontSize:18,fontFamily:"'JetBrains Mono',monospace",fontWeight:700}}>{chip}</div></div>:
       <><div onClick={()=>setScanning(true)} style={{width:'100%',minHeight:180,borderRadius:22,background:C.card,border:`2px dashed ${C.border}`,display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',padding:24,cursor:'pointer',textAlign:'center'}}><div style={{fontSize:48,marginBottom:10}}>📷</div><div style={{fontSize:15,fontWeight:900}}>Scan barcode</div><div style={{fontSize:12,color:C.textLight,marginTop:4}}>Point camera at chip barcode</div></div>
       <div style={{textAlign:'center',marginTop:14}}><button onClick={()=>setManual(!manual)} style={{background:'none',border:'none',color:C.primary,fontWeight:700,fontSize:13,cursor:'pointer',fontFamily:"'Nunito',sans-serif"}}>⌨️ Type manually</button></div>
-      {manual&&<div style={{marginTop:12}}><input value={chip} onChange={e=>setChip(e.target.value)} placeholder="Chip number..." style={{width:'100%',padding:'14px',borderRadius:14,border:`2px solid ${C.primary}`,fontSize:17,fontFamily:"'JetBrains Mono',monospace",outline:'none',boxSizing:'border-box',textAlign:'center'}}/><Btn primary full onClick={()=>{if(chip.length>=9){setScanned(true);setTimeout(()=>setStep(1),400)}}} disabled={chip.length<9} style={{marginTop:10}}>Confirm</Btn></div>}</>}
+      {manual&&<div style={{marginTop:12}}>
+        <input value={chip} onChange={e=>{setChip(e.target.value);setChipErr('')}} placeholder="15-digit chip number" style={{width:'100%',padding:'14px',borderRadius:14,border:`2px solid ${chipErr?C.urgent:C.primary}`,fontSize:17,fontFamily:"'JetBrains Mono',monospace",outline:'none',boxSizing:'border-box',textAlign:'center'}}/>
+        {chipErr&&<div style={{fontSize:12,color:C.urgent,fontWeight:700,marginTop:6,textAlign:'center'}}>{chipErr}</div>}
+        <Btn primary full onClick={()=>acceptChip(chip)} style={{marginTop:10}}>Validate & continue</Btn>
+      </div>}</>}
     </div>}
 
     {step===1&&<div>
-      <div style={{background:C.successBg,borderRadius:10,padding:'8px 12px',marginBottom:16,fontSize:12,fontWeight:700,color:C.success,fontFamily:"'JetBrains Mono',monospace"}}>📟 {chip}</div>
+      <div style={{background:C.successBg,borderRadius:10,padding:'8px 12px',marginBottom:6,fontSize:12,fontWeight:700,color:C.success,fontFamily:"'JetBrains Mono',monospace"}}>📟 {chip}</div>
+      {chipInfo&&<div style={{fontSize:11,color:C.textMid,marginBottom:14,paddingLeft:4}}>{chipInfo.type==='country'?`📍 Registered region: ${chipInfo.country}`:chipInfo.type==='manufacturer'?`🏭 Manufacturer: ${chipInfo.manufacturer}`:'🔖 Legacy format (no region data)'} · {chipInfo.standard}</div>}
       <div onClick={()=>fileRef.current?.click()} style={{width:'100%',height:160,borderRadius:18,background:photoPreview?'transparent':C.card,border:photoPreview?'none':`2px dashed ${C.border}`,display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',cursor:'pointer',marginBottom:14,overflow:'hidden',position:'relative'}}>
         {photoPreview?<img src={photoPreview} style={{width:'100%',height:'100%',objectFit:'cover'}}/>:<><div style={{fontSize:36,marginBottom:6}}>🐾</div><div style={{fontSize:13,fontWeight:800}}>Tap to add pet photo</div><div style={{fontSize:11,color:C.textLight}}>Camera or gallery</div></>}
       </div>
@@ -243,8 +440,8 @@ function Register({role,user,show,back}){
       <div style={{fontSize:11,fontWeight:800,color:C.textLight,marginBottom:8}}>ANIMAL</div>
       <div style={{display:'flex',gap:6,marginBottom:10}}>{[['cat','🐱'],['dog','🐕'],['other','🐾']].map(([v,i])=><button key={v} onClick={()=>u('species',v)} style={{flex:1,padding:'10px',borderRadius:12,fontWeight:700,fontSize:12,cursor:'pointer',fontFamily:"'Nunito',sans-serif",border:form.species===v?'none':`1.5px solid ${C.border}`,background:form.species===v?C.primary:C.card,color:form.species===v?'#fff':C.text}}>{i} {v}</button>)}</div>
       <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:8,marginBottom:8}}>
-        <input value={form.animal_name} onChange={e=>u('animal_name',e.target.value)} placeholder="Name *" style={{padding:'12px',borderRadius:12,border:`1.5px solid ${C.border}`,fontSize:14,fontFamily:"'Nunito',sans-serif",outline:'none',background:C.bg}}/>
-        <input value={form.color} onChange={e=>u('color',e.target.value)} placeholder="Color" style={{padding:'12px',borderRadius:12,border:`1.5px solid ${C.border}`,fontSize:14,fontFamily:"'Nunito',sans-serif",outline:'none',background:C.bg}}/>
+        <Input value={form.animal_name} onChange={e=>u('animal_name',e.target.value)} placeholder="Name *"/>
+        <Input value={form.color} onChange={e=>u('color',e.target.value)} placeholder="Color"/>
       </div>
       <div style={{display:'flex',gap:6,marginBottom:14}}>{[['female','♀'],['male','♂']].map(([v,i])=><button key={v} onClick={()=>u('sex',v)} style={{flex:1,padding:'10px',borderRadius:12,fontWeight:700,fontSize:13,cursor:'pointer',fontFamily:"'Nunito',sans-serif",border:form.sex===v?'none':`1.5px solid ${C.border}`,background:form.sex===v?C.primary:C.card,color:form.sex===v?'#fff':C.text}}>{i} {v}</button>)}</div>
       <Btn primary full onClick={()=>setStep(2)} disabled={!form.animal_name}>Next → Owner</Btn>
@@ -253,16 +450,23 @@ function Register({role,user,show,back}){
     {step===2&&<div>
       <div style={{background:C.successBg,borderRadius:10,padding:'8px 12px',marginBottom:16,fontSize:12,fontWeight:700,color:C.success}}>📟 {chip} · 🐾 {form.animal_name}</div>
       <div style={{fontSize:11,fontWeight:800,color:C.textLight,marginBottom:8}}>👤 OWNER</div>
-      {[{k:'owner_name',p:'Full name *'},{k:'owner_phone',p:'Phone *'},{k:'owner_email',p:'Email'},{k:'owner_city',p:'City'}].map(x=><input key={x.k} value={form[x.k]} onChange={e=>u(x.k,e.target.value)} placeholder={x.p} style={{width:'100%',padding:'12px 14px',borderRadius:12,border:`1.5px solid ${C.border}`,fontSize:14,fontFamily:"'Nunito',sans-serif",outline:'none',background:C.bg,marginBottom:8,boxSizing:'border-box'}}/>)}
-      <Btn primary full onClick={()=>setStep(3)} disabled={!form.owner_name||!form.owner_phone} style={{marginTop:4}}>Next → Review</Btn>
+      <Input value={form.owner_name} onChange={e=>u('owner_name',e.target.value)} placeholder="Full name *" style={{marginBottom:8}}/>
+      <Input value={form.owner_phone} err={phoneErr} onBlur={()=>setTouched(t=>({...t,owner_phone:true}))} onChange={e=>u('owner_phone',e.target.value)} placeholder="Phone * (e.g. +34 600 000 000)" style={{marginBottom:phoneErr?2:8}}/>
+      {phoneErr&&<div style={{fontSize:11,color:C.urgent,fontWeight:700,marginBottom:8}}>Enter a valid phone (7–15 digits, may start with +)</div>}
+      <Input value={form.owner_email} err={emailErr} onBlur={()=>setTouched(t=>({...t,owner_email:true}))} onChange={e=>u('owner_email',e.target.value)} placeholder="Email (optional)" style={{marginBottom:emailErr?2:8}}/>
+      {emailErr&&<div style={{fontSize:11,color:C.urgent,fontWeight:700,marginBottom:8}}>Enter a valid email address</div>}
+      <Input value={form.owner_city} onChange={e=>u('owner_city',e.target.value)} placeholder="City" style={{marginBottom:8}}/>
+      <Btn primary full onClick={()=>{setTouched({owner_phone:true,owner_email:true});if(form.owner_name&&isValidPhone(form.owner_phone)&&isValidEmail(form.owner_email))setStep(3)}} disabled={!form.owner_name||!form.owner_phone} style={{marginTop:4}}>Next → Review</Btn>
       <div style={{textAlign:'center',marginTop:10}}><Btn small onClick={()=>setStep(1)}>← Back</Btn></div>
     </div>}
 
     {step===3&&<div>
+      {dupe&&<div style={{background:'#FEF2F2',borderRadius:14,padding:'12px 14px',border:`1px solid #FECACA`,marginBottom:12,fontSize:12,color:C.urgent,lineHeight:1.5}}>⚠️ This chip number is already registered in Pawsy. Search for it instead, or check the number.</div>}
       <div style={{background:C.card,borderRadius:16,padding:16,border:`1px solid ${C.border}`,marginBottom:14}}>
         <div style={{fontSize:13,fontWeight:900,marginBottom:10}}>📋 Review</div>
         {photoPreview&&<img src={photoPreview} style={{width:'100%',height:100,objectFit:'cover',borderRadius:10,marginBottom:10}}/>}
-        <div style={{fontSize:13,fontFamily:"'JetBrains Mono',monospace",color:C.primary,background:C.primaryLight,padding:'6px 10px',borderRadius:8,marginBottom:8,fontWeight:700}}>📟 {chip}</div>
+        <div style={{fontSize:13,fontFamily:"'JetBrains Mono',monospace",color:C.primary,background:C.primaryLight,padding:'6px 10px',borderRadius:8,marginBottom:6,fontWeight:700}}>📟 {chip}</div>
+        {chipInfo&&<div style={{fontSize:11,color:C.textMid,marginBottom:8}}>{chipInfo.type==='country'?`📍 ${chipInfo.country}`:chipInfo.type==='manufacturer'?`🏭 ${chipInfo.manufacturer}`:'🔖 Legacy'}</div>}
         <div style={{fontSize:14,fontWeight:900}}>{form.animal_name}</div>
         <div style={{fontSize:12,color:C.textMid}}>{form.color} · {form.species} · {form.sex}</div>
         <div style={{borderTop:`1px solid ${C.border}`,marginTop:10,paddingTop:10,fontSize:12,color:C.textMid}}>
@@ -271,7 +475,7 @@ function Register({role,user,show,back}){
           {form.owner_city&&<div>📍 {form.owner_city}</div>}
         </div>
       </div>
-      <div style={{background:'#FFFBEB',borderRadius:16,padding:16,border:'1px solid #FDE68A',marginBottom:14}}>
+      <div style={{background:C.warnBg,borderRadius:16,padding:16,border:'1px solid #FDE68A',marginBottom:14}}>
         <div style={{fontSize:12,fontWeight:900,color:'#92400E',marginBottom:8}}>🔒 GDPR Consent</div>
         <div onClick={()=>setGdpr(!gdpr)} style={{display:'flex',gap:10,cursor:'pointer'}}>
           <div style={{width:22,height:22,borderRadius:6,border:`2px solid ${gdpr?C.success:'#D97706'}`,background:gdpr?C.success:'transparent',display:'flex',alignItems:'center',justifyContent:'center',color:'#fff',fontSize:13,fontWeight:900,flexShrink:0}}>{gdpr?'✓':''}</div>
@@ -392,9 +596,12 @@ function Profile({user,go,show,setEdit}){
 function EditPetScreen({pet,show,back}){
   const[f,sF]=useState(pet?{animal_name:pet.animal_name||'',color:pet.color||'',sex:pet.sex||'unknown',species:pet.species||'cat',owner_name:pet.owner_name||'',owner_phone:pet.owner_phone||'',owner_email:pet.owner_email||'',owner_city:pet.owner_city||''}:{})
   const[saving,setSaving]=useState(false)
+  const[err,setErr]=useState('')
 
   const save=async()=>{
-    setSaving(true);await updatePet(pet.id,f);setSaving(false);show('✅ Updated!');back()
+    if(f.owner_phone&&!isValidPhone(f.owner_phone)){setErr('Invalid phone');return}
+    if(f.owner_email&&!isValidEmail(f.owner_email)){setErr('Invalid email');return}
+    setErr('');setSaving(true);await updatePet(pet.id,f);setSaving(false);show('✅ Updated!');back()
   }
 
   if(!pet)return null
@@ -404,10 +611,11 @@ function EditPetScreen({pet,show,back}){
     <div style={{fontSize:13,fontFamily:"'JetBrains Mono',monospace",color:C.primary,background:C.primaryLight,padding:'8px 12px',borderRadius:10,marginBottom:16,fontWeight:700}}>📟 {pet.chip_number}</div>
     <div style={{background:C.card,borderRadius:16,padding:16,border:`1px solid ${C.border}`,marginBottom:16}}>
       <div style={{fontSize:11,fontWeight:800,color:C.textLight,marginBottom:8}}>🐾 ANIMAL</div>
-      {[{k:'animal_name',p:'Name'},{k:'color',p:'Color'}].map(x=><input key={x.k} value={f[x.k]} onChange={e=>sF({...f,[x.k]:e.target.value})} placeholder={x.p} style={{width:'100%',padding:'12px',borderRadius:12,border:`1.5px solid ${C.border}`,fontSize:14,fontFamily:"'Nunito',sans-serif",outline:'none',background:C.bg,marginBottom:8,boxSizing:'border-box'}}/>)}
+      {[{k:'animal_name',p:'Name'},{k:'color',p:'Color'}].map(x=><Input key={x.k} value={f[x.k]} onChange={e=>sF({...f,[x.k]:e.target.value})} placeholder={x.p} style={{marginBottom:8}}/>)}
       <div style={{fontSize:11,fontWeight:800,color:C.textLight,marginBottom:8,marginTop:8}}>👤 OWNER</div>
-      {[{k:'owner_name',p:'Name'},{k:'owner_phone',p:'Phone'},{k:'owner_email',p:'Email'},{k:'owner_city',p:'City'}].map(x=><input key={x.k} value={f[x.k]} onChange={e=>sF({...f,[x.k]:e.target.value})} placeholder={x.p} style={{width:'100%',padding:'12px',borderRadius:12,border:`1.5px solid ${C.border}`,fontSize:14,fontFamily:"'Nunito',sans-serif",outline:'none',background:C.bg,marginBottom:8,boxSizing:'border-box'}}/>)}
+      {[{k:'owner_name',p:'Name'},{k:'owner_phone',p:'Phone'},{k:'owner_email',p:'Email'},{k:'owner_city',p:'City'}].map(x=><Input key={x.k} value={f[x.k]} onChange={e=>sF({...f,[x.k]:e.target.value})} placeholder={x.p} style={{marginBottom:8}}/>)}
     </div>
+    {err&&<div style={{background:'#FEF2F2',color:C.urgent,fontSize:12,fontWeight:700,padding:'10px 14px',borderRadius:10,marginBottom:12}}>{err}</div>}
     <Btn primary full onClick={save} disabled={saving}>{saving?'Saving...':'💾 Save Changes'}</Btn>
   </div>)
 }
@@ -421,7 +629,7 @@ function Settings({user,go}){
     {[{icon:'👤',l:'Account',d:user?.email},
       {icon:'🔒',l:'Privacy Policy',d:'How we protect your data'},
       {icon:'📄',l:'Terms of Service',d:'Usage terms'},
-      {icon:'ℹ️',l:'About Pawsy',d:'Version 5.0 — Free forever'},
+      {icon:'ℹ️',l:'About Pawsy',d:'Version 6.0 — Free forever'},
     ].map((i,idx)=><div key={idx} style={{display:'flex',alignItems:'center',gap:12,padding:'14px',background:C.card,borderRadius:14,border:`1px solid ${C.border}`,marginBottom:8}}><span style={{fontSize:20}}>{i.icon}</span><div style={{flex:1}}><div style={{fontSize:14,fontWeight:800}}>{i.l}</div><div style={{fontSize:11,color:C.textLight}}>{i.d}</div></div></div>)}
     <Btn full onClick={logout} style={{marginTop:20,borderColor:C.urgent,color:C.urgent}}>🚪 Sign Out</Btn>
   </div>)
